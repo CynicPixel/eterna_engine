@@ -1,5 +1,4 @@
-# Eterna Engine — Minimal Implementation
-
+# Eterna Engine
 This project implements the MVP described in the task: Market Order execution with DEX routing between Raydium and Meteora, WebSocket lifecycle streaming, BullMQ queue, PostgreSQL order history, and Redis for active order state.
 
 Quick start (PowerShell):
