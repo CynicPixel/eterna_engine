@@ -6,6 +6,10 @@ A high-performance order execution engine for Solana DEX trading with intelligen
 
 This system processes market orders across Raydium and Meteora DEXs, automatically selecting the best execution venue based on price comparison. Built with Fastify, BullMQ, PostgreSQL, and Redis, the engine handles concurrent order processing with exponential backoff retry logic and comprehensive failure tracking.
 
+# Demo Video
+
+[![Watch the video](https://img.youtube.com/vi/1wb_8ObfQ_M/hqdefault.jpg)](https://www.youtube.com/watch?v=1wb_8ObfQ_M)
+
 ## Design Decisions
 
 **Order Type: Market Orders**
@@ -228,7 +232,6 @@ NODE_ENV=development
 
 ## Future Enhancements
 
-- **Devnet Integration**: Replace mock adapters with real SDK calls to Raydium and Meteora Cp-AMM
 - **Limit Orders**: Add price monitoring worker for conditional execution
 - **Sniper Orders**: Integrate mempool listeners for token launch detection
 - **Advanced Routing**: Multi-hop routing across DEX pools for optimal prices
