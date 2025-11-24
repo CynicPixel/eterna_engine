@@ -1,149 +1,207 @@
 import { DexQuote } from '../types';
-import AmmImpl, { DEVNET_POOL } from '@meteora-ag/dynamic-amm-sdk';
+import { CpAmm, getTokenProgram } from '@meteora-ag/cp-amm-sdk';
 import { getConnection, getWallet, parsePublicKey } from '../utils/solana';
-import { PublicKey } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
+import { createSyncNativeInstruction, getOrCreateAssociatedTokenAccount, NATIVE_MINT } from '@solana/spl-token';
 import BN from 'bn.js';
 import Decimal from 'decimal.js';
+
+interface MeteoraPoolConfig {
+  name: string;
+  address: PublicKey;
+  mintA: PublicKey;
+  mintB: PublicKey;
+  decimalsA: number;
+  decimalsB: number;
+}
+
+const DEVNET_METEORA_POOLS: MeteoraPoolConfig[] = [
+  {
+    name: 'USDC/SOL (Meteora Cp-AMM devnet)',
+    address: new PublicKey('9ovvHUVz8g26BWUXtXrjksz8ZvdFsxLMf763ZrxMvHAz'),
+    mintA: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'), // USDC devnet
+    mintB: new PublicKey('So11111111111111111111111111111111111111112'),   // Wrapped SOL
+    decimalsA: 6,
+    decimalsB: 9,
+  },
+];
+
+let cachedCpAmm: CpAmm | null = null;
+
+function getCpAmm(): CpAmm {
+  if (!cachedCpAmm) {
+    cachedCpAmm = new CpAmm(getConnection());
+  }
+  return cachedCpAmm;
+}
+
+const TEN = new Decimal(10);
 
 export class MeteoraAdapter {
   name = 'meteora';
 
   async getQuote(params: { tokenIn: string; tokenOut: string; amountIn: number; slippage: number }): Promise<DexQuote> {
     const connection = getConnection();
-    
+    const cpAmm = getCpAmm();
+
     const mintIn = parsePublicKey(params.tokenIn);
     const mintOut = parsePublicKey(params.tokenOut);
-    
-    // Find pool for this token pair from known devnet pools
-    const poolAddress = this.findPoolAddress(params.tokenIn, params.tokenOut);
-    
-    if (!poolAddress) {
-      throw new Error(`No Meteora pool found for pair ${params.tokenIn}/${params.tokenOut}`);
+    const { config, inputIsTokenA } = this.resolvePoolConfig(mintIn, mintOut);
+
+    const poolState = await cpAmm.fetchPoolState(config.address);
+    const slot = await connection.getSlot();
+    const blockTime = await connection.getBlockTime(slot).catch(() => null);
+    const timestamp = blockTime ?? Math.floor(Date.now() / 1000);
+
+    const inputDecimals = inputIsTokenA ? config.decimalsA : config.decimalsB;
+    const outputDecimals = inputIsTokenA ? config.decimalsB : config.decimalsA;
+    const amountInLamports = this.toLamports(params.amountIn, inputDecimals);
+
+    const quote = cpAmm.getQuote({
+      inAmount: amountInLamports,
+      inputTokenMint: mintIn,
+      slippage: params.slippage,
+      poolState,
+      currentTime: timestamp,
+      currentSlot: slot,
+      tokenADecimal: config.decimalsA,
+      tokenBDecimal: config.decimalsB,
+    });
+
+    // Ensure pool vault can actually pay the quoted output amount
+    const outputVault = inputIsTokenA ? poolState.tokenBVault : poolState.tokenAVault;
+    const vaultBalanceInfo = await connection.getTokenAccountBalance(outputVault);
+    const vaultLamports = new BN(vaultBalanceInfo.value.amount);
+    if (vaultLamports.lt(quote.swapOutAmount)) {
+      throw new Error('Meteora pool liquidity is insufficient for the requested output amount');
     }
 
-    // Initialize AMM - cast connection to any to avoid version mismatch
-    const amm = await AmmImpl.create(connection as any, poolAddress);
-    
-    // Pool state is available as a property
-    const poolState = amm.poolState;
-    
-    // Determine token indices
-    const isTokenAIn = mintIn.equals(poolState.tokenAMint);
-    const inputDecimals = isTokenAIn ? amm.tokenAMint.decimals : amm.tokenBMint.decimals;
-    const outputDecimals = isTokenAIn ? amm.tokenBMint.decimals : amm.tokenAMint.decimals;
-    
-    // Convert input amount to lamports
-    const amountInLamports = new BN(Math.floor(params.amountIn * Math.pow(10, inputDecimals)));
-    
-    // Calculate swap quote using the built-in method
-    const swapQuote = amm.getSwapQuote(
-      mintIn,
-      amountInLamports,
-      params.slippage // Meteora expects decimal (0.01 = 1%)
-    );
-
-    if (!swapQuote) {
-      throw new Error('Failed to calculate swap quote from Meteora');
-    }
-
-    // Convert output to token units
-    const amountOut = new Decimal(swapQuote.swapOutAmount.toString())
-      .div(Math.pow(10, outputDecimals))
-      .toNumber();
-
-    // Calculate price impact: (inAmount - outAmount) / inAmount
-    const inValue = params.amountIn;
-    const priceImpact = Math.abs((inValue - amountOut) / inValue);
-    
-    const fee = swapQuote.fee.toNumber() / amountInLamports.toNumber();
+    const amountOut = this.fromLamports(quote.swapOutAmount, outputDecimals);
+    const totalFee = new Decimal(quote.totalFee.toString());
+    const feeRatio = amountInLamports.isZero()
+      ? 0
+      : totalFee.div(amountInLamports.toString()).toNumber();
 
     return {
       dex: this.name,
       amountOut,
-      priceImpact,
-      fee,
-      poolAddress: poolAddress.toBase58(),
+      priceImpact: quote.priceImpact.toNumber(),
+      fee: feeRatio,
+      poolAddress: config.address.toBase58(),
     };
   }
 
   async executeSwap(params: { tokenIn: string; tokenOut: string; amountIn: number; minAmountOut: number; userWallet: any }): Promise<{ txHash: string; executionPrice: number }> {
     const connection = getConnection();
     const wallet = getWallet();
-    
+    const cpAmm = getCpAmm();
+
     const mintIn = parsePublicKey(params.tokenIn);
     const mintOut = parsePublicKey(params.tokenOut);
+    const { config, inputIsTokenA } = this.resolvePoolConfig(mintIn, mintOut);
 
-    // Find pool
-    const poolAddress = this.findPoolAddress(params.tokenIn, params.tokenOut);
-    
-    if (!poolAddress) {
-      throw new Error(`No Meteora pool found for swap`);
+    const poolState = await cpAmm.fetchPoolState(config.address);
+    const inputDecimals = inputIsTokenA ? config.decimalsA : config.decimalsB;
+    const outputDecimals = inputIsTokenA ? config.decimalsB : config.decimalsA;
+
+    const amountInLamports = this.toLamports(params.amountIn, inputDecimals);
+    const minAmountOutLamports = this.toLamports(params.minAmountOut, outputDecimals);
+
+    if (mintIn.equals(NATIVE_MINT)) {
+      await this.ensureNativeLiquidity(connection, wallet, amountInLamports);
     }
 
-    // Initialize AMM
-    const amm = await AmmImpl.create(connection as any, poolAddress);
-    
-    const isTokenAIn = mintIn.equals(amm.poolState.tokenAMint);
-    const inputDecimals = isTokenAIn ? amm.tokenAMint.decimals : amm.tokenBMint.decimals;
-    const outputDecimals = isTokenAIn ? amm.tokenBMint.decimals : amm.tokenAMint.decimals;
-    
-    const amountInLamports = new BN(Math.floor(params.amountIn * Math.pow(10, inputDecimals)));
-    const minAmountOutLamports = new BN(Math.floor(params.minAmountOut * Math.pow(10, outputDecimals)));
+    const swapTx = await cpAmm.swap({
+      payer: wallet.publicKey,
+      pool: config.address,
+      inputTokenMint: mintIn,
+      outputTokenMint: mintOut,
+      amountIn: amountInLamports,
+      minimumAmountOut: minAmountOutLamports,
+      tokenAMint: poolState.tokenAMint,
+      tokenBMint: poolState.tokenBMint,
+      tokenAVault: poolState.tokenAVault,
+      tokenBVault: poolState.tokenBVault,
+      tokenAProgram: getTokenProgram(poolState.tokenAFlag),
+      tokenBProgram: getTokenProgram(poolState.tokenBFlag),
+      referralTokenAccount: null,
+      poolState,
+    });
 
-    // Get swap transaction
-    const swapTx = await amm.swap(
-      wallet.publicKey,
-      mintIn,
-      amountInLamports,
-      minAmountOutLamports
-    );
-
-    // Sign and send transaction
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
     swapTx.recentBlockhash = blockhash;
     swapTx.feePayer = wallet.publicKey;
-    
     swapTx.sign(wallet);
-    
-    const txId = await connection.sendRawTransaction(swapTx.serialize(), {
+
+    const signature = await connection.sendRawTransaction(swapTx.serialize(), {
       skipPreflight: false,
       preflightCommitment: 'confirmed',
     });
 
-    // Confirm transaction
     await connection.confirmTransaction({
-      signature: txId,
+      signature,
       blockhash,
       lastValidBlockHeight,
     }, 'confirmed');
 
-    // Calculate execution price
-    const executionPrice = params.minAmountOut / params.amountIn;
+    const executionPrice = params.amountIn === 0 ? 0 : params.minAmountOut / params.amountIn;
 
     return {
-      txHash: txId,
+      txHash: signature,
       executionPrice,
     };
   }
 
-  /**
-   * Helper to find pool address for token pair
-   * In production, this would query on-chain or use an API
-   * For now, searches known devnet pools
-   */
-  private findPoolAddress(tokenA: string, tokenB: string): PublicKey | null {
-    // DEVNET_POOL is an object with named pools, not an array
-    const poolEntries = Object.entries(DEVNET_POOL);
-    
-    for (const [poolName, poolAddress] of poolEntries) {
-      // For devnet, we need to fetch pool info to check mints
-      // For now, return the first available pool that matches common pairs
-      // In production, implement proper pool discovery
-      if (poolName.includes('USDC') || poolName.includes('SOL')) {
-        return poolAddress as PublicKey;
+  private resolvePoolConfig(mintIn: PublicKey, mintOut: PublicKey): { config: MeteoraPoolConfig; inputIsTokenA: boolean } {
+    for (const config of DEVNET_METEORA_POOLS) {
+      if (config.mintA.equals(mintIn) && config.mintB.equals(mintOut)) {
+        return { config, inputIsTokenA: true };
+      }
+      if (config.mintA.equals(mintOut) && config.mintB.equals(mintIn)) {
+        return { config, inputIsTokenA: false };
       }
     }
-    
-    return null;
+    throw new Error(`No Meteora Cp-AMM pool configured for pair ${mintIn.toBase58()}/${mintOut.toBase58()}`);
+  }
+
+  private toLamports(amount: number, decimals: number): BN {
+    if (amount <= 0) {
+      return new BN(0);
+    }
+    const lamports = new Decimal(amount).mul(TEN.pow(decimals)).floor();
+    return new BN(lamports.toFixed(0));
+  }
+
+  private fromLamports(value: BN, decimals: number): number {
+    if (value.isZero()) {
+      return 0;
+    }
+    return new Decimal(value.toString()).div(TEN.pow(decimals)).toNumber();
+  }
+
+  private async ensureNativeLiquidity(connection: Connection, wallet: Keypair, amountNeeded: BN): Promise<void> {
+    if (amountNeeded.isZero()) {
+      return;
+    }
+
+    const ata = await getOrCreateAssociatedTokenAccount(connection, wallet, NATIVE_MINT, wallet.publicKey);
+    const currentBalance = new BN(ata.amount.toString());
+    if (currentBalance.gte(amountNeeded)) {
+      return;
+    }
+
+    const topUpLamports = amountNeeded.sub(currentBalance);
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: ata.address,
+        lamports: topUpLamports.toNumber(),
+      }),
+      createSyncNativeInstruction(ata.address),
+    );
+
+    await sendAndConfirmTransaction(connection, tx, [wallet], {
+      commitment: 'confirmed',
+    });
   }
 }

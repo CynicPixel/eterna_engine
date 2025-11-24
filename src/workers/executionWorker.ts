@@ -7,17 +7,26 @@ import { getOrder, updateOrderStatus } from '../db/repositories/orderRepo';
 import { getRaydiumAdapter, getMeteoraAdapter } from '../adapters';
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
-const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+let sharedConnection: IORedis | null = null;
+
+function getConnection(): IORedis {
+  if (!sharedConnection) {
+    sharedConnection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+  }
+  return sharedConnection;
+}
 
 export async function startWorker() {
   const concurrency = Number(process.env.BULLMQ_CONCURRENCY || 10);
   const maxRetryAttempts = Number(process.env.MAX_RETRY_ATTEMPTS || 3);
+  const connection = getConnection();
   
   const worker = new Worker(
     'orders',
     async (job: Job) => {
       const { orderId } = job.data as any;
-      const currentAttempt = job.attemptsMade;
+      const currentAttempt = job.attemptsMade ?? 0;
+      console.log(`[worker] processing order ${orderId} attempt ${currentAttempt}`);
       
       try {
         const order = await getOrder(orderId);
@@ -51,20 +60,24 @@ export async function startWorker() {
 
         await finalizeOrderConfirmed(orderId, execResult.txHash, execResult.executionPrice);
       } catch (err: any) {
-        const attempts = job.attemptsMade;
+        const attemptsMade = job.attemptsMade ?? 0;
+        const willBeFinalAttempt = attemptsMade + 1 >= maxRetryAttempts;
         
-        // If this was the last attempt, mark as failed permanently
-        // BullMQ will not retry after maxRetryAttempts
-        if (attempts >= maxRetryAttempts) {
-          await failOrder(job.data.orderId, String(err), attempts);
-          console.error(`Order ${job.data.orderId} failed after ${attempts} attempts: ${err.message}`);
-        } else {
-          console.warn(`Order ${job.data.orderId} attempt ${attempts} failed, will retry: ${err.message}`);
-          // Update retry count but don't mark as failed yet
-          await updateOrderStatus(job.data.orderId, { retry_count: attempts });
+        // Better error serialization
+        const errorMsg = err?.message || err?.toString() || JSON.stringify(err) || 'Unknown error';
+        console.error(`[worker] Error details:`, err);
+
+        if (willBeFinalAttempt) {
+          // Mark as failed permanently and notify clients
+          await failOrder(job.data.orderId, errorMsg, attemptsMade + 1);
+          console.error(`Order ${job.data.orderId} failed finally after ${attemptsMade + 1} attempts: ${errorMsg}`);
+          // Do not re-throw because we've handled final failure
+          return;
         }
-        
-        // Re-throw to trigger BullMQ retry mechanism
+
+        // Not final yet: increment retry_count in DB and rethrow to let BullMQ retry
+        console.warn(`Order ${job.data.orderId} attempt ${attemptsMade + 1} failed, will retry: ${errorMsg}`);
+        await updateOrderStatus(job.data.orderId, { retry_count: attemptsMade + 1 });
         throw err;
       }
     },
@@ -89,5 +102,16 @@ export async function startWorker() {
     console.log('Job completed', job.id);
   });
   
+  await worker.waitUntilReady();
   return worker;
+}
+
+export async function stopWorker(worker?: Worker | null) {
+  if (worker) {
+    await worker.close();
+  }
+  if (sharedConnection) {
+    await sharedConnection.quit();
+    sharedConnection = null;
+  }
 }

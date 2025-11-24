@@ -11,6 +11,11 @@ export default async function routes(fastify: FastifyInstance) {
   const redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
   const queue = new Queue('orders', { connection: redis });
 
+  fastify.addHook('onClose', async () => {
+    await queue.close();
+    await redis.quit();
+  });
+
   // Single endpoint handling both HTTP POST and WebSocket
   // POST for initial order submission, GET with Upgrade header for WebSocket
   

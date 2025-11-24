@@ -3,20 +3,17 @@ import { MeteoraAdapter } from './meteoraAdapter';
 import { RaydiumMockAdapter } from './raydiumMockAdapter';
 import { MeteoraMockAdapter } from './meteoraMockAdapter';
 
-const DEX_MODE = process.env.DEX_MODE || 'mock';
+function useRealAdapters() {
+  const mode = (process.env.DEX_MODE || 'mock').toLowerCase();
+  return mode === 'real' || mode === 'devnet';
+}
 
 export function getRaydiumAdapter() {
-  if (DEX_MODE === 'real' || DEX_MODE === 'devnet') {
-    return new RaydiumAdapter();
-  }
-  return new RaydiumMockAdapter();
+  return useRealAdapters() ? new RaydiumAdapter() : new RaydiumMockAdapter();
 }
 
 export function getMeteoraAdapter() {
-  if (DEX_MODE === 'real' || DEX_MODE === 'devnet') {
-    return new MeteoraAdapter();
-  }
-  return new MeteoraMockAdapter();
+  return useRealAdapters() ? new MeteoraAdapter() : new MeteoraMockAdapter();
 }
 
 // Export both real and mock for direct usage when needed

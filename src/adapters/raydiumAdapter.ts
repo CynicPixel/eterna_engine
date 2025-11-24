@@ -5,6 +5,22 @@ import { PublicKey } from '@solana/web3.js';
 import BN from 'bn.js';
 import Decimal from 'decimal.js';
 
+interface DevnetPoolConfig {
+  id: string;
+  label: string;
+  mintA: string;
+  mintB: string;
+}
+
+const DEVNET_RAYDIUM_CPMM_POOLS: DevnetPoolConfig[] = [
+  {
+    id: '3EctRbo17tTSuV2c44X4cx8aGs9HtWRsFCedNRBh3xv6',
+    label: 'SOL/USDC (Raydium CPMM devnet)',
+    mintA: 'So11111111111111111111111111111111111111112', // Wrapped SOL
+    mintB: 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr', // Devnet USDC
+  },
+];
+
 export class RaydiumAdapter {
   name = 'raydium';
   private raydium: Raydium | null = null;
@@ -19,11 +35,47 @@ export class RaydiumAdapter {
         connection,
         cluster: 'devnet',
         disableFeatureCheck: true,
-        disableLoadToken: false,
+        disableLoadToken: true, // skip token list API (devnet endpoint is flaky)
         blockhashCommitment: 'finalized',
       });
     }
     return this.raydium;
+  }
+
+  private isDevnet(): boolean {
+    const endpoint = getConnection().rpcEndpoint?.toLowerCase() ?? '';
+    return endpoint.includes('devnet');
+  }
+
+  private findDevnetPoolId(mintIn: PublicKey, mintOut: PublicKey): string | null {
+    const inKey = mintIn.toBase58();
+    const outKey = mintOut.toBase58();
+    const match = DEVNET_RAYDIUM_CPMM_POOLS.find((pool) => (
+      (pool.mintA === inKey && pool.mintB === outKey) ||
+      (pool.mintA === outKey && pool.mintB === inKey)
+    ));
+    return match ? match.id : null;
+  }
+
+  private async resolvePoolId(mintIn: PublicKey, mintOut: PublicKey): Promise<string> {
+    if (this.isDevnet()) {
+      const fallbackId = this.findDevnetPoolId(mintIn, mintOut);
+      if (fallbackId) {
+        return fallbackId;
+      }
+      throw new Error(`No Raydium devnet pool found for pair ${mintIn.toBase58()}/${mintOut.toBase58()}`);
+    }
+
+    const raydium = await this.getRaydium();
+    const poolsData = await raydium.api.fetchPoolByMints({
+      mint1: mintIn,
+      mint2: mintOut,
+    });
+    if (poolsData?.data?.length) {
+      return poolsData.data[0].id;
+    }
+
+    throw new Error(`No Raydium pool found for pair ${mintIn.toBase58()}/${mintOut.toBase58()}`);
   }
 
   async getQuote(params: { tokenIn: string; tokenOut: string; amountIn: number; slippage: number }): Promise<DexQuote> {
@@ -31,26 +83,10 @@ export class RaydiumAdapter {
     
     const mintIn = parsePublicKey(params.tokenIn);
     const mintOut = parsePublicKey(params.tokenOut);
+    const poolId = await this.resolvePoolId(mintIn, mintOut);
     
-    // Search for CPMM pools with this token pair
-    const poolsData = await raydium.api.fetchPoolByMints({
-      mint1: params.tokenIn,
-      mint2: params.tokenOut,
-    });
-
-    if (!poolsData || !poolsData.data || poolsData.data.length === 0) {
-      throw new Error(`No Raydium pool found for pair ${params.tokenIn}/${params.tokenOut}`);
-    }
-
-    const pool = poolsData.data[0];
-    
-    // Get pool RPC data for reserves
-    const poolRpcData = await raydium.cpmm.getRpcPoolInfos([pool.id]);
-    const rpcData = poolRpcData[pool.id];
-    
-    if (!rpcData) {
-      throw new Error(`Could not fetch pool RPC data for ${pool.id}`);
-    }
+    // Get pool RPC data for reserves (includes config info)
+    const { rpcData } = await raydium.cpmm.getPoolInfoFromRpc(poolId);
 
     // Determine direction
     const baseIn = mintIn.equals(rpcData.mintA);
@@ -91,7 +127,7 @@ export class RaydiumAdapter {
       amountOut,
       priceImpact,
       fee,
-      poolAddress: pool.id,
+      poolAddress: poolId,
     };
   }
 
@@ -101,28 +137,15 @@ export class RaydiumAdapter {
     const mintIn = parsePublicKey(params.tokenIn);
     const mintOut = parsePublicKey(params.tokenOut);
 
-    // Find pool
-    const poolsData = await raydium.api.fetchPoolByMints({
-      mint1: params.tokenIn,
-      mint2: params.tokenOut,
-    });
-
-    if (!poolsData || !poolsData.data || poolsData.data.length === 0) {
-      throw new Error(`No Raydium pool found for swap`);
-    }
-
-    const pool = poolsData.data[0];
-    const { poolInfo, poolKeys } = await raydium.cpmm.getPoolInfoFromRpc(pool.id);
+    const poolId = await this.resolvePoolId(mintIn, mintOut);
+    const { poolInfo, poolKeys, rpcData } = await raydium.cpmm.getPoolInfoFromRpc(poolId);
     
     const baseIn = mintIn.equals(new PublicKey(poolInfo.mintA.address));
     const inputMint = poolInfo[baseIn ? 'mintA' : 'mintB'];
     const outputMint = poolInfo[baseIn ? 'mintB' : 'mintA'];
     
     const amountInLamports = new BN(Math.floor(params.amountIn * Math.pow(10, inputMint.decimals)));
-
-    // Get RPC data for swap computation
-    const poolRpcData = await raydium.cpmm.getRpcPoolInfos([pool.id]);
-    const rpcData = poolRpcData[pool.id];
+    const minAmountOutLamports = new BN(Math.floor(params.minAmountOut * Math.pow(10, outputMint.decimals)));
 
     const poolData = {
       baseReserve: rpcData.vaultAAmount,
@@ -141,14 +164,14 @@ export class RaydiumAdapter {
       swapBaseIn: true,
     });
 
-    // Build and execute swap transaction
+    // Build and execute swap transaction using minAmountOut from params
     const { execute } = await raydium.cpmm.swap({
       poolInfo,
       poolKeys,
       inputAmount: amountInLamports,
       swapResult: {
         inputAmount: swapResult.amountIn,
-        outputAmount: swapResult.amountOut,
+        outputAmount: minAmountOutLamports,  // Use user's min acceptable output
       },
       baseIn,
       fixedOut: false,
@@ -159,8 +182,10 @@ export class RaydiumAdapter {
       },
     });
 
+    console.log('[raydiumAdapter] executing transaction...');
     // Execute transaction
     const { txId } = await execute({ sendAndConfirm: true });
+    console.log('[raydiumAdapter] transaction successful:', txId);
     
     // Calculate execution price from actual output
     const actualAmountOut = new Decimal(swapResult.amountOut.toString())
