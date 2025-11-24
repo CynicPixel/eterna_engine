@@ -1,8 +1,8 @@
 import { DexQuote } from '../types';
-import { RaydiumAdapter, MeteoraAdapter } from '../adapters';
+import { getRaydiumAdapter, getMeteoraAdapter } from '../adapters';
 
-const raydium = new RaydiumAdapter();
-const meteora = new MeteoraAdapter();
+const raydium = getRaydiumAdapter();
+const meteora = getMeteoraAdapter();
 
 export async function getQuotes(tokenIn: string, tokenOut: string, amountIn: number, slippage: number) {
   const [r, m] = await Promise.all([
