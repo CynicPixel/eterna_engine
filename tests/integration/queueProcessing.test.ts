@@ -143,4 +143,61 @@ describe('BullMQ Queue Processing', () => {
     // Should have attempted max times
     expect(attempts).toBe(maxAttempts);
   }, 5000);
+
+  it('should use exponential backoff for retries', async () => {
+    const attemptTimes: number[] = [];
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    worker = new Worker(
+      queue.name,
+      async (job) => {
+        attempts++;
+        attemptTimes.push(Date.now());
+        throw new Error(`Attempt ${attempts} failed`);
+      },
+      {
+        connection: redis,
+        settings: {
+          backoffStrategy: (attemptsMade: number) => {
+            // Exponential backoff: 1s, 2s, 4s
+            return Math.pow(2, attemptsMade - 1) * 1000;
+          }
+        }
+      }
+    );
+
+    const job = await queue.add(
+      'exponential-backoff-job', 
+      { orderId: 'backoff-test' }, 
+      { 
+        attempts: maxAttempts,
+        backoff: {
+          type: 'exponential',
+          delay: 1000
+        }
+      }
+    );
+
+    // Wait for all retries to complete
+    await new Promise((resolve) => setTimeout(resolve, 8000));
+
+    // Should have attempted max times
+    expect(attempts).toBe(maxAttempts);
+    
+    // Verify exponential backoff delays
+    if (attemptTimes.length >= 2) {
+      const delay1 = attemptTimes[1] - attemptTimes[0];
+      // First retry should be ~1000ms after first attempt
+      expect(delay1).toBeGreaterThanOrEqual(900);
+      expect(delay1).toBeLessThanOrEqual(1500);
+    }
+    
+    if (attemptTimes.length >= 3) {
+      const delay2 = attemptTimes[2] - attemptTimes[1];
+      // Second retry should be ~2000ms after second attempt
+      expect(delay2).toBeGreaterThanOrEqual(1800);
+      expect(delay2).toBeLessThanOrEqual(2500);
+    }
+  }, 10000);
 });
