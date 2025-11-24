@@ -1,12 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { RaydiumAdapter } from '../../src/adapters/raydiumAdapter';
-import { MeteoraAdapter } from '../../src/adapters/meteoraAdapter';
+import { getRaydiumAdapter, getMeteoraAdapter } from '../../src/adapters';
 
 describe('Raydium Adapter', () => {
-  let adapter: RaydiumAdapter;
+  let adapter: ReturnType<typeof getRaydiumAdapter>;
 
   beforeAll(() => {
-    adapter = new RaydiumAdapter();
+    adapter = getRaydiumAdapter();
   });
 
   it('should return a valid quote', async () => {
@@ -51,10 +50,10 @@ describe('Raydium Adapter', () => {
 });
 
 describe('Meteora Adapter', () => {
-  let adapter: MeteoraAdapter;
+  let adapter: ReturnType<typeof getMeteoraAdapter>;
 
   beforeAll(() => {
-    adapter = new MeteoraAdapter();
+    adapter = getMeteoraAdapter();
   });
 
   it('should return a valid quote', async () => {

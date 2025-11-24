@@ -4,8 +4,7 @@ import { getQuotes, chooseBest } from '../services/dexRouter';
 import { markOrderBuilding, markOrderSubmitted, finalizeOrderConfirmed, failOrder } from '../services/orderService';
 import { WebSocketManager } from '../api/websocket/manager';
 import { getOrder, updateOrderStatus } from '../db/repositories/orderRepo';
-import { RaydiumAdapter } from '../adapters/raydiumAdapter';
-import { MeteoraAdapter } from '../adapters/meteoraAdapter';
+import { getRaydiumAdapter, getMeteoraAdapter } from '../adapters';
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
 const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
@@ -27,10 +26,10 @@ export async function startWorker() {
         // Update retry count in database
         await updateOrderStatus(orderId, { retry_count: currentAttempt });
 
-        WebSocketManager.sendStatus(orderId, { status: 'pending', retryCount: currentAttempt });
+        await WebSocketManager.sendStatus(orderId, { status: 'pending', retryCount: currentAttempt });
 
         const quotes = await getQuotes(order.token_in, order.token_out, Number(order.amount_in), Number(order.slippage || 0.01));
-        WebSocketManager.sendStatus(orderId, { status: 'routing', quotes, retryCount: currentAttempt });
+        await WebSocketManager.sendStatus(orderId, { status: 'routing', quotes, retryCount: currentAttempt });
 
         const chosen = chooseBest(quotes as any);
         await markOrderBuilding(orderId, chosen.dex);
@@ -38,10 +37,10 @@ export async function startWorker() {
         // execute via chosen adapter
         let execResult: any;
         if (chosen.dex === 'raydium') {
-          const a = new RaydiumAdapter();
+          const a = getRaydiumAdapter();
           execResult = await a.executeSwap({ tokenIn: order.token_in, tokenOut: order.token_out, amountIn: Number(order.amount_in), minAmountOut: chosen.amountOut * (1 - Number(order.slippage || 0.01)), userWallet: order.user_wallet });
         } else {
-          const a = new MeteoraAdapter();
+          const a = getMeteoraAdapter();
           execResult = await a.executeSwap({ tokenIn: order.token_in, tokenOut: order.token_out, amountIn: Number(order.amount_in), minAmountOut: chosen.amountOut * (1 - Number(order.slippage || 0.01)), userWallet: order.user_wallet });
         }
 
