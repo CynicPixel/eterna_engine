@@ -245,4 +245,127 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
       setTimeout(() => reject(new Error('No failed status received')), 7000);
     });
   }, 10000);
+
+  it('should handle HTTP POST returning orderId for later WebSocket connection', async () => {
+    // This tests the HTTP-only path (without upgrade)
+    // POST returns orderId, then client can connect to WebSocket with that orderId
+    const http = await import('http');
+    
+    return new Promise<void>((resolve, reject) => {
+      const postData = JSON.stringify({
+        userWallet: '7xKWQE6zHqXmbKZ7eXrSRREepUxJbPr14erMovNxZq7X',
+        tokenIn: 'So11111111111111111111111111111111111111112',
+        tokenOut: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+        amountIn: 0.1,
+        slippage: 0.01,
+      });
+
+      const options = {
+        hostname: 'localhost',
+        port: 3000,
+        path: '/api/orders/execute',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+        },
+      };
+
+      const req = http.request(options, (res) => {
+        let data = '';
+        
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+
+        res.on('end', () => {
+          try {
+            const response = JSON.parse(data);
+            expect(response.orderId).toBeTruthy();
+            expect(response.websocket).toContain('/api/orders/execute');
+            expect(response.websocket).toContain(response.orderId);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.write(postData);
+      req.end();
+
+      setTimeout(() => reject(new Error('HTTP POST timeout')), 5000);
+    });
+  }, 7000);
+
+  it('should connect to WebSocket with orderId from POST response', async () => {
+    // Test the full flow: POST to get orderId, then WebSocket to get updates
+    const http = await import('http');
+    
+    return new Promise<void>((resolve, reject) => {
+      const postData = JSON.stringify({
+        userWallet: '7xKWQE6zHqXmbKZ7eXrSRREepUxJbPr14erMovNxZq7X',
+        tokenIn: 'So11111111111111111111111111111111111111112',
+        tokenOut: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+        amountIn: 0.1,
+        slippage: 0.01,
+      });
+
+      const options = {
+        hostname: 'localhost',
+        port: 3000,
+        path: '/api/orders/execute',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+        },
+      };
+
+      // First: POST to create order
+      const req = http.request(options, (res) => {
+        let data = '';
+        
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+
+        res.on('end', () => {
+          try {
+            const response = JSON.parse(data);
+            const orderId = response.orderId;
+            
+            // Second: Connect to WebSocket with orderId
+            ws = new WebSocket(`${WS_URL}?orderId=${orderId}`);
+            
+            ws.on('open', () => {
+              expect(ws.readyState).toBe(WebSocket.OPEN);
+            });
+
+            ws.on('message', (data) => {
+              const message = JSON.parse(data.toString());
+              
+              // Should receive connected message and/or status updates
+              if (message.status === 'connected' || message.orderId === orderId) {
+                expect(message.orderId || message.status).toBeTruthy();
+                ws.close();
+                resolve();
+              }
+            });
+
+            ws.on('error', reject);
+            
+            setTimeout(() => reject(new Error('WebSocket timeout')), 5000);
+          } catch (err) {
+            reject(err);
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.write(postData);
+      req.end();
+    });
+  }, 10000);
 });

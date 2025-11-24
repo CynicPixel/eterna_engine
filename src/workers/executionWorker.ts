@@ -12,18 +12,25 @@ const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 
 export async function startWorker() {
   const concurrency = Number(process.env.BULLMQ_CONCURRENCY || 10);
+  const maxRetryAttempts = Number(process.env.MAX_RETRY_ATTEMPTS || 3);
+  
   const worker = new Worker(
     'orders',
     async (job: Job) => {
       const { orderId } = job.data as any;
+      const currentAttempt = job.attemptsMade;
+      
       try {
         const order = await getOrder(orderId);
         if (!order) throw new Error('order not found');
 
-        WebSocketManager.sendStatus(orderId, { status: 'pending' });
+        // Update retry count in database
+        await updateOrderStatus(orderId, { retry_count: currentAttempt });
+
+        WebSocketManager.sendStatus(orderId, { status: 'pending', retryCount: currentAttempt });
 
         const quotes = await getQuotes(order.token_in, order.token_out, Number(order.amount_in), Number(order.slippage || 0.01));
-        WebSocketManager.sendStatus(orderId, { status: 'routing', quotes });
+        WebSocketManager.sendStatus(orderId, { status: 'routing', quotes, retryCount: currentAttempt });
 
         const chosen = chooseBest(quotes as any);
         await markOrderBuilding(orderId, chosen.dex);
@@ -45,21 +52,43 @@ export async function startWorker() {
 
         await finalizeOrderConfirmed(orderId, execResult.txHash, execResult.executionPrice);
       } catch (err: any) {
-        const attempts = job.attemptsMade || 0;
-        if (attempts >= Number(process.env.MAX_RETRY_ATTEMPTS || 3) - 1) {
+        const attempts = job.attemptsMade;
+        
+        // If this was the last attempt, mark as failed permanently
+        // BullMQ will not retry after maxRetryAttempts
+        if (attempts >= maxRetryAttempts) {
           await failOrder(job.data.orderId, String(err), attempts);
+          console.error(`Order ${job.data.orderId} failed after ${attempts} attempts: ${err.message}`);
+        } else {
+          console.warn(`Order ${job.data.orderId} attempt ${attempts} failed, will retry: ${err.message}`);
+          // Update retry count but don't mark as failed yet
+          await updateOrderStatus(job.data.orderId, { retry_count: attempts });
         }
+        
+        // Re-throw to trigger BullMQ retry mechanism
         throw err;
       }
     },
-    { connection, concurrency }
+    { 
+      connection, 
+      concurrency,
+      settings: {
+        // BullMQ worker settings for retry
+        backoffStrategy: (attemptsMade: number) => {
+          // Exponential backoff: 1s, 2s, 4s
+          return Math.pow(2, attemptsMade - 1) * 1000;
+        }
+      }
+    }
   );
 
   worker.on('failed', (job, err) => {
-    console.error('Job failed', job?.id, err?.message);
+    console.error('Job failed', job?.id, 'attemptsMade:', job?.attemptsMade, 'error:', err?.message);
   });
 
   worker.on('completed', (job) => {
     console.log('Job completed', job.id);
   });
+  
+  return worker;
 }
