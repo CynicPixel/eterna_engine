@@ -3,8 +3,12 @@ import { startServer } from './api/server';
 import { startWorker } from './workers/executionWorker';
 
 async function main() {
-  const server = await startServer();
-  console.log(`API listening on ${server.address()}`);
+  const fastify = await startServer();
+  const addressInfo = fastify.server.address();
+  const address = typeof addressInfo === 'object' && addressInfo
+    ? `${addressInfo.address}:${addressInfo.port}`
+    : String(addressInfo);
+  console.log(`API listening on ${address}`);
 
   // start worker in same process for simplicity (can be separate)
   await startWorker();

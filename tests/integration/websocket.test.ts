@@ -1,9 +1,51 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
 import WebSocket from 'ws';
+import type { FastifyInstance } from 'fastify';
+import type { Worker } from 'bullmq';
+import { buildServer } from '../../src/api/server';
+import { startWorker, stopWorker } from '../../src/workers/executionWorker';
+import redis from '../../src/redis/client';
 
 describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
-  const WS_URL = 'ws://localhost:3000/api/orders/execute';
   let ws: WebSocket;
+  let fastify: FastifyInstance;
+  let worker: Worker | null = null;
+  let WS_URL = 'ws://127.0.0.1:0/api/orders/execute';
+  let HTTP_HOST = '127.0.0.1';
+  let HTTP_PORT = 3000;
+
+  const getWsUrl = (orderId?: string) => (orderId ? `${WS_URL}?orderId=${orderId}` : WS_URL);
+
+  beforeAll(async () => {
+    process.env.DEX_MODE = 'mock';
+    process.env.MAX_RETRY_ATTEMPTS = process.env.MAX_RETRY_ATTEMPTS || '1';
+
+    fastify = await buildServer();
+    await fastify.listen({ port: 0, host: '127.0.0.1' });
+
+    const addressInfo = fastify.server.address();
+    if (!addressInfo || typeof addressInfo === 'string') {
+      throw new Error('Unable to determine test server address');
+    }
+
+    HTTP_HOST = addressInfo.address === '::' ? '127.0.0.1' : addressInfo.address;
+    HTTP_PORT = addressInfo.port;
+    WS_URL = `ws://${HTTP_HOST}:${HTTP_PORT}/api/orders/execute`;
+
+    worker = await startWorker();
+  }, 20000);
+
+  afterAll(async () => {
+    await stopWorker(worker);
+    if (fastify) {
+      await fastify.close();
+    }
+    try {
+      await redis.quit();
+    } catch (err) {
+      // ignore shutdown timeouts in tests
+    }
+  }, 10000);
 
   afterEach(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -13,7 +55,7 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
 
   it('should connect to WebSocket endpoint', async () => {
     return new Promise<void>((resolve, reject) => {
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(getWsUrl());
 
       ws.on('open', () => {
         expect(ws.readyState).toBe(WebSocket.OPEN);
@@ -31,7 +73,7 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
 
   it('should receive orderId after sending order', async () => {
     return new Promise<void>((resolve, reject) => {
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(getWsUrl());
 
       ws.on('open', () => {
         const order = {
@@ -62,7 +104,7 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
 
   it('should receive status updates throughout order lifecycle', async () => {
     return new Promise<void>((resolve, reject) => {
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(getWsUrl());
       const statuses: string[] = [];
       let orderId: string;
 
@@ -117,7 +159,7 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
 
   it('should complete full end-to-end flow: WebSocket → DB → Queue → Adapter → Status broadcast', async () => {
     return new Promise<void>((resolve, reject) => {
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(getWsUrl());
       const statuses: string[] = [];
       let orderId: string;
       let receivedQuotes = false;
@@ -213,7 +255,7 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
 
   it('should emit failed status with failureReason for invalid orders', async () => {
     return new Promise<void>((resolve, reject) => {
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(getWsUrl());
 
       ws.on('open', () => {
         const badOrder = {
@@ -261,8 +303,8 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
       });
 
       const options = {
-        hostname: 'localhost',
-        port: 3000,
+        hostname: HTTP_HOST,
+        port: HTTP_PORT,
         path: '/api/orders/execute',
         method: 'POST',
         headers: {
@@ -313,8 +355,8 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
       });
 
       const options = {
-        hostname: 'localhost',
-        port: 3000,
+        hostname: HTTP_HOST,
+        port: HTTP_PORT,
         path: '/api/orders/execute',
         method: 'POST',
         headers: {
@@ -337,7 +379,7 @@ describe('WebSocket Lifecycle (requires running server on port 3000)', () => {
             const orderId = response.orderId;
             
             // Second: Connect to WebSocket with orderId
-            ws = new WebSocket(`${WS_URL}?orderId=${orderId}`);
+            ws = new WebSocket(getWsUrl(orderId));
             
             ws.on('open', () => {
               expect(ws.readyState).toBe(WebSocket.OPEN);
