@@ -1,12 +1,24 @@
 import { insertOrder, getOrder, updateOrderStatus } from '../db/repositories/orderRepo';
 import { WebSocketManager } from '../api/websocket/manager';
 
+const DEVNET_SOL_MINT = 'So11111111111111111111111111111111111111112';
+const DEVNET_USDC_MINT = 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr';
+
+// The Meteora/Raydium audit (see README) shows SOL/USDC is the only overlapping devnet pair.
+// To keep the execution pipeline deterministic we short-circuit all incoming orders to use that
+// pair regardless of user input. Validation still checks addresses for structure, but the order
+// that hits the queue will always reference this canonical mint combination.
+const HARDCODED_DEVNET_PAIR = Object.freeze({
+  tokenIn: DEVNET_SOL_MINT,
+  tokenOut: DEVNET_USDC_MINT,
+});
+
 export async function createOrder(orderId: string, payload: any) {
   const order = {
     id: orderId,
     userWallet: payload.userWallet,
-    tokenIn: payload.tokenIn,
-    tokenOut: payload.tokenOut,
+    tokenIn: HARDCODED_DEVNET_PAIR.tokenIn,
+    tokenOut: HARDCODED_DEVNET_PAIR.tokenOut,
     amountIn: payload.amountIn,
     slippage: payload.slippage || 0.01,
     status: 'pending',

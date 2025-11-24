@@ -76,4 +76,15 @@ export function validateOrderPayload(payload: any): void {
   if (payload.tokenIn === payload.tokenOut) {
     throw new ValidationError('tokenIn and tokenOut must be different');
   }
+
+  if ((process.env.DEX_MODE || 'mock') === 'devnet') {
+    const solMint = 'So11111111111111111111111111111111111111112';
+    const devnetUsdcMint = 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr';
+    const tokens = [payload.tokenIn, payload.tokenOut];
+    const hasSol = tokens.includes(solMint);
+    const hasDevnetUsdc = tokens.includes(devnetUsdcMint);
+    if (!(hasSol && hasDevnetUsdc)) {
+      throw new ValidationError('Devnet mode currently supports only SOL/USDC swaps');
+    }
+  }
 }

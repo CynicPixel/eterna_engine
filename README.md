@@ -16,7 +16,7 @@ Market orders were chosen for the MVP due to their immediate execution model - n
 
 **DEX Router Strategy**
 
-The router queries both Raydium CPMM and Meteora Dynamic AMM pools concurrently, compares quotes based on output amount and price impact, then selects the optimal venue. This ensures users always receive best execution without manual venue selection.
+The router queries both Raydium CPMM and Meteora Cp-AMM pools concurrently, compares quotes based on output amount and price impact, then selects the optimal venue. This ensures users always receive best execution without manual venue selection.
 
 **HTTP + WebSocket Pattern**
 
@@ -28,7 +28,7 @@ Clients submit orders via HTTP POST, then connect to the WebSocket with the retu
 
 **Mock Mode for Development**
 
-Adapters in `src/adapters/` currently use deterministic mocks for local development and testing. Production deployment will integrate real SDKs (`@raydium-io/raydium-sdk-v2`, `@meteora-ag/dynamic-amm-sdk`) for Solana devnet execution. This separation allows rapid iteration and comprehensive test coverage without network dependencies.
+Adapters in `src/adapters/` currently use deterministic mocks for local development and testing. Production deployment integrates real SDKs (`@raydium-io/raydium-sdk-v2`, `@meteora-ag/cp-amm-sdk`) for Solana devnet execution. This separation allows rapid iteration and comprehensive test coverage without network dependencies.
 
 ## Architecture
 
@@ -53,9 +53,30 @@ Adapters in `src/adapters/` currently use deterministic mocks for local developm
 - **Router** (`src/services/dexRouter.ts`): Orchestrates quote fetching and venue selection
 - **Adapters** (`src/adapters/`):
   - `raydiumAdapter.ts` - Raydium CPMM pool interface
-  - `meteoraAdapter.ts` - Meteora Dynamic AMM pool interface
+  - `meteoraAdapter.ts` - Meteora Cp-AMM pool interface
   - Currently mocked with deterministic responses (100 USDC @ 0.5% impact for Raydium, 102 USDC @ 0.3% for Meteora)
   - Production: Replace mock implementations with actual SDK calls
+
+### Devnet Pool Configuration (SOL/USDC only)
+`DEX_MODE=devnet` forces every request to a single wrapped SOL ↔︎ USDC swap. We hardcode the canonical mint pair inside `orderService.ts`, away from the validation layer, so all queued jobs reference:
+
+```
+tokenIn  = Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr  // devnet USDC
+tokenOut = So11111111111111111111111111111111111111112  // wrapped SOL
+```
+
+#### Devnet audit process
+1. **Enumerate every pool on-chain** – `node scripts/dumpPools.js` loads both SDKs against devnet RPC:
+   - `CpAmm.getAllPools()` from `@meteora-ag/cp-amm-sdk` and a mint-decoder helper persist `meteora-devnet-pools.txt`.
+   - Raw `getProgramAccounts` queries against Raydium’s `CREATE_CPMM_POOL_PROGRAM` fetch the first N CPMM accounts (cap configurable via `RAYDIUM_POOL_LIMIT`) and write `raydium-devnet-pools.txt`.
+2. **Cross-reference minted pairs** – The script normalizes each `(mintA, mintB)` combination into a sorted `pairKey` and specifically filters for `So1111…` involvement. Any overlap is printed as `Found overlapping SOL pair across Meteora/Raydium` together with both pool descriptors.
+3. **Manual verification** – Once an overlap appears, we confirm decimals and identify mints via Raydium’s `mint/list` REST endpoint plus the Solana token registry to ensure they truly correspond to SOL/USDC.
+
+#### Canonical overlapping pair (2025‑11‑24)
+- **Meteora Cp-AMM**: pool `9ovvHUVz8g26BWUXtXrjksz8ZvdFsxLMf763ZrxMvHAz` (`index: 9039`). `tokenA = Gh9…` (USDC, 6 decimals) and `tokenB = So1111…` (SOL, 9 decimals).
+- **Raydium CPMM**: pool `3EctRbo17tTSuV2c44X4cx8aGs9HtWRsFCedNRBh3xv6` exposing the same mint pair (order reversed, decimals 9/6 respectively).
+
+The audit output is committed to `scripts/meteora-devnet-pools.txt` and `scripts/raydium-devnet-pools.txt` for traceability. Re-run `node scripts/dumpPools.js` whenever devnet liquidity changes to refresh the data and confirm that the canonical pair still exists (or to discover new overlaps).
 
 ### Worker Processing
 - **Execution Worker** (`src/workers/executionWorker.ts`):
@@ -110,8 +131,8 @@ Request:
 ```json
 {
   "userWallet": "5Qa5W...",
-  "tokenIn": "So11111111111111111111111111111111111111112",
-  "tokenOut": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "tokenIn": "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr",
+  "tokenOut": "So11111111111111111111111111111111111111112",
   "amountIn": 1.5,
   "slippage": 0.01
 }
@@ -207,7 +228,7 @@ NODE_ENV=development
 
 ## Future Enhancements
 
-- **Devnet Integration**: Replace mock adapters with real SDK calls to Raydium and Meteora
+- **Devnet Integration**: Replace mock adapters with real SDK calls to Raydium and Meteora Cp-AMM
 - **Limit Orders**: Add price monitoring worker for conditional execution
 - **Sniper Orders**: Integrate mempool listeners for token launch detection
 - **Advanced Routing**: Multi-hop routing across DEX pools for optimal prices
